@@ -11,7 +11,10 @@ if [ "$#" -lt 3 ]; then
     echo "L1d Prefetchers:"
     echo "  1) IP Stride"
     echo "  2) PA2 Prefetcher"
-    echo "  3) No Prefetcher"
+    echo "  3) Stride Pattern Prefetcher (SPP)"
+    echo "  4) Global Stream Prefetcher"
+    echo "  5) Alecto selector (stride + SPP + global stream)"
+    echo "  6) No Prefetcher"
     echo
     echo "L2 Replacement Policies:"
     echo "  1) LRU"

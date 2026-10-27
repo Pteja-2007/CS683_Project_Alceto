@@ -1,0 +1,506 @@
+#include "cache.h"
+
+#include <array>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+
+namespace {
+constexpr uint32_t ALLOCATION_ENTRIES = 64;
+constexpr uint32_t SAMPLE_ENTRIES = 64;
+constexpr uint32_t SANDBOX_SETS = 128;
+constexpr uint32_t SANDBOX_WAYS = 4;
+constexpr uint32_t SANDBOX_ENTRIES = SANDBOX_SETS * SANDBOX_WAYS;
+constexpr uint32_t PC_CONTEXT_ENTRIES = 256;
+constexpr uint32_t PATTERN_ENTRIES = 128;
+constexpr uint32_t STREAM_ENTRIES = 16;
+constexpr uint32_t PREDICTOR_COUNT = 3;
+constexpr uint32_t EPOCH_DEMANDS = 100;
+constexpr uint32_t DEAD_LIMIT = 150;
+constexpr int8_t MAX_IB = -8;
+constexpr int8_t MAX_IA = 5;
+constexpr uint32_t CONSERVATIVE_DEGREE = 3;
+constexpr double PROFICIENCY_BOUNDARY = 0.75;
+constexpr double DEFICIENCY_BOUNDARY = 0.05;
+constexpr uint32_t SIGNATURE_LENGTH = 3;
+
+enum class Kind : uint8_t { UI, IA, IB };
+struct AllocState {
+  Kind kind = Kind::UI;
+  int8_t level = 0;
+};
+struct AllocationEntry {
+  uint64_t pc = 0;
+  std::array<AllocState, PREDICTOR_COUNT> state{};
+  bool valid = false;
+};
+struct SampleEntry {
+  uint64_t pc = 0;
+  uint16_t demands = 0;
+  uint8_t dead = 0;
+  std::array<uint64_t, PREDICTOR_COUNT> issued{};
+  std::array<uint64_t, PREDICTOR_COUNT> confirmed{};
+  std::array<uint16_t, PREDICTOR_COUNT> epoch_issued{};
+  bool epoch_had_ia = false;
+  bool valid = false;
+};
+struct SandboxEntry {
+  uint64_t line = 0;
+  uint64_t owner_pc = 0;
+  uint32_t token = 0;
+  uint8_t predictor = 0;
+  bool l1_requested = false;
+  bool l1_filled = false;
+  bool valid = false;
+};
+struct PcContext {
+  uint64_t pc = 0;
+  std::array<uint64_t, 2> last_line{};
+  std::array<int64_t, 2> last_stride{};
+  std::array<std::array<int64_t, SIGNATURE_LENGTH>, 2> history{};
+  std::array<uint8_t, 2> history_count{};
+  std::array<uint8_t, 2> uniform_confidence{};
+  bool valid = false;
+  std::array<bool, 2> has_last{};
+};
+struct PatternEntry {
+  uint64_t key = 0;
+  int64_t next_stride = 0;
+  uint8_t confidence = 0;
+  bool valid = false;
+};
+struct StreamEntry {
+  uint64_t next_line = 0;
+  uint64_t page = 0;
+  bool valid = false;
+};
+
+std::array<std::array<AllocationEntry, ALLOCATION_ENTRIES>, NUM_CPUS> allocations{};
+std::array<std::array<SampleEntry, SAMPLE_ENTRIES>, NUM_CPUS> samples{};
+std::array<std::array<SandboxEntry, SANDBOX_ENTRIES>, NUM_CPUS> sandbox{};
+std::array<std::array<uint8_t, SANDBOX_SETS>, NUM_CPUS> sandbox_replace{};
+std::array<std::array<PcContext, PC_CONTEXT_ENTRIES>, NUM_CPUS> contexts{};
+std::array<std::array<PatternEntry, PATTERN_ENTRIES>, NUM_CPUS> patterns{};
+std::array<std::array<StreamEntry, STREAM_ENTRIES>, NUM_CPUS> streams{};
+std::array<uint32_t, NUM_CPUS> next_stream{};
+std::array<uint32_t, NUM_CPUS> next_sandbox_token{};
+std::array<uint64_t, NUM_CPUS> last_global_line{};
+std::array<bool, NUM_CPUS> has_global_line{};
+
+uint32_t pc_index(uint64_t pc, uint32_t size)
+{
+  return static_cast<uint32_t>((pc ^ (pc >> 11) ^ (pc >> 23)) % size);
+}
+uint32_t line_set(uint64_t line)
+{
+  return static_cast<uint32_t>((line ^ (line >> 9) ^ (line >> 19)) % SANDBOX_SETS);
+}
+uint64_t make_signature(uint64_t pc, const std::array<int64_t, SIGNATURE_LENGTH>& h)
+{
+  uint64_t key = 1469598103934665603ULL ^ pc;
+  for (int64_t stride : h) {
+    key ^= static_cast<uint64_t>(stride);
+    key *= 1099511628211ULL;
+  }
+  return key;
+}
+
+AllocationEntry& allocation(uint32_t cpu, uint64_t pc)
+{
+  AllocationEntry& e = allocations[cpu][pc_index(pc, ALLOCATION_ENTRIES)];
+  if (!e.valid || e.pc != pc) {
+    e = AllocationEntry{};
+    e.pc = pc;
+    e.valid = true;
+  }
+  return e;
+}
+SampleEntry& sample(uint32_t cpu, uint64_t pc)
+{
+  SampleEntry& e = samples[cpu][pc_index(pc, SAMPLE_ENTRIES)];
+  if (!e.valid || e.pc != pc) {
+    e = SampleEntry{};
+    e.pc = pc;
+    e.valid = true;
+  }
+  return e;
+}
+PcContext& context(uint32_t cpu, uint64_t pc)
+{
+  PcContext& e = contexts[cpu][pc_index(pc, PC_CONTEXT_ENTRIES)];
+  if (!e.valid || e.pc != pc) {
+    e = PcContext{};
+    e.pc = pc;
+    e.valid = true;
+  }
+  return e;
+}
+
+uint32_t degree_for(const AllocState& state)
+{
+  return state.kind == Kind::IA
+             ? CONSERVATIVE_DEGREE + static_cast<uint32_t>(state.level) + 1
+             : CONSERVATIVE_DEGREE;
+}
+bool receives_demand(const AllocState& state)
+{
+  return state.kind != Kind::IB;
+}
+
+void transition_epoch(uint32_t cpu, uint64_t pc)
+{
+  SampleEntry& s = sample(cpu, pc);
+  AllocationEntry& a = allocation(cpu, pc);
+  for (const AllocState& st : a.state)
+    s.epoch_had_ia |= st.kind == Kind::IA;
+  if (++s.demands < EPOCH_DEMANDS)
+    return;
+  s.demands = 0;
+
+  std::array<double, PREDICTOR_COUNT> accuracy{};
+  std::array<bool, PREDICTOR_COUNT> had_issue{};
+  for (uint32_t p = 0; p < PREDICTOR_COUNT; ++p) {
+    had_issue[p] = s.issued[p] != 0;
+    accuracy[p] = had_issue[p]
+                      ? static_cast<double>(s.confirmed[p]) / s.issued[p]
+                      : 0.0;
+  }
+
+  bool promoted = false;
+  for (uint32_t p = 0; p < PREDICTOR_COUNT; ++p) {
+    AllocState& st = a.state[p];
+    if (st.kind == Kind::UI && had_issue[p] &&
+        accuracy[p] >= PROFICIENCY_BOUNDARY) {
+      st.kind = Kind::IA;
+      st.level = 0;
+      promoted = true;
+    }
+  }
+
+  for (uint32_t p = 0; p < PREDICTOR_COUNT; ++p) {
+    AllocState& st = a.state[p];
+    if (st.kind == Kind::UI) {
+      if (had_issue[p] && accuracy[p] < DEFICIENCY_BOUNDARY) {
+        st.kind = Kind::IB;
+        st.level = MAX_IB;
+      } else if (promoted) {
+        st.kind = Kind::IB;
+        st.level = 0;
+      }
+    } else if (st.kind == Kind::IA) {
+      if (accuracy[p] >= PROFICIENCY_BOUNDARY) {
+        if (st.level < MAX_IA) ++st.level;
+      } else if (accuracy[p] < DEFICIENCY_BOUNDARY) {
+        if (st.level > 0) --st.level;
+        else {
+          st.kind = Kind::UI;
+          st.level = 0;
+        }
+      } else if (st.level == 0 && accuracy[p] < PROFICIENCY_BOUNDARY) {
+        st.kind = Kind::UI;
+      }
+    } else if (st.level < 0) {
+      ++st.level;
+    }
+  }
+
+  bool any_ia = false;
+  for (const AllocState& st : a.state) any_ia |= st.kind == Kind::IA;
+  if (!any_ia) {
+    for (AllocState& st : a.state) {
+      if (st.kind == Kind::IB && st.level == 0) {
+        st.kind = Kind::UI;
+        st.level = 0;
+      }
+    }
+  }
+
+  uint32_t epoch_total_issued = 0;
+  for (uint16_t n : s.epoch_issued) epoch_total_issued += n;
+  if (s.epoch_had_ia && epoch_total_issued == 0) {
+    if (s.dead < DEAD_LIMIT) ++s.dead;
+  } else if (s.dead) {
+    --s.dead;
+  }
+  if (s.dead >= DEAD_LIMIT) {
+    a.state = {};
+    s.dead = 0;
+  }
+  s.epoch_issued.fill(0);
+  s.epoch_had_ia = false;
+}
+
+SandboxEntry* find_sandbox(uint32_t cpu, uint64_t line)
+{
+  const uint32_t set = line_set(line);
+  for (uint32_t way = 0; way < SANDBOX_WAYS; ++way) {
+    SandboxEntry& e = sandbox[cpu][set * SANDBOX_WAYS + way];
+    if (e.valid && e.line == line) return &e;
+  }
+  return nullptr;
+}
+
+SandboxEntry& allocate_sandbox(uint32_t cpu, uint64_t line)
+{
+  const uint32_t set = line_set(line);
+  const uint32_t base = set * SANDBOX_WAYS;
+  for (uint32_t way = 0; way < SANDBOX_WAYS; ++way) {
+    SandboxEntry& e = sandbox[cpu][base + way];
+    if (!e.valid) return e;
+  }
+  const uint32_t victim = sandbox_replace[cpu][set] % SANDBOX_WAYS;
+  sandbox_replace[cpu][set] =
+      static_cast<uint8_t>((victim + 1) % SANDBOX_WAYS);
+  return sandbox[cpu][base + victim];
+}
+
+void issue_one(CACHE* cache, uint64_t pc, uint64_t base_addr,
+               uint64_t line, uint32_t predictor, uint32_t distance,
+               uint64_t base_page)
+{
+  if (line > (std::numeric_limits<uint64_t>::max() >> LOG2_BLOCK_SIZE)) return;
+  const uint64_t address = line << LOG2_BLOCK_SIZE;
+  if ((address >> LOG2_PAGE_SIZE) != base_page ||
+      find_sandbox(cache->cpu, line) != nullptr)
+    return;
+
+  const int fill = distance < CONSERVATIVE_DEGREE ? FILL_L1 : FILL_L2;
+  uint32_t token = ++next_sandbox_token[cache->cpu];
+  if (token == 0) token = ++next_sandbox_token[cache->cpu];
+  if (!cache->prefetch_line(pc, base_addr, address, fill, token)) return;
+
+  SandboxEntry& tag = allocate_sandbox(cache->cpu, line);
+  tag = SandboxEntry{};
+  tag.line = line;
+  tag.owner_pc = pc;
+  SampleEntry& s = sample(cache->cpu, pc);
+  tag.token = token;
+  tag.predictor = static_cast<uint8_t>(predictor);
+  tag.l1_requested = fill == FILL_L1;
+  tag.valid = true;
+  if (tag.l1_requested) {
+    if (s.issued[predictor] != std::numeric_limits<uint64_t>::max())
+      ++s.issued[predictor];
+    if (s.epoch_issued[predictor] != std::numeric_limits<uint16_t>::max())
+      ++s.epoch_issued[predictor];
+  }
+}
+
+void issue_stride(CACHE* cache, uint64_t pc, uint64_t addr, uint64_t line,
+                  int64_t stride, const AllocState& state, uint32_t predictor)
+{
+  if (!stride) return;
+  const uint32_t degree = degree_for(state);
+  const uint64_t page = addr >> LOG2_PAGE_SIZE;
+  for (uint32_t d = 1; d <= degree; ++d) {
+    const __int128 target = static_cast<__int128>(line) +
+                            static_cast<__int128>(stride) * d;
+    if (target < 0 || target > std::numeric_limits<uint64_t>::max()) break;
+    issue_one(cache, pc, addr, static_cast<uint64_t>(target), predictor,
+              d - 1, page);
+  }
+}
+
+uint32_t pattern_index(uint64_t pc, uint64_t key)
+{
+  const uint64_t folded = key ^ (key >> 32) ^ pc ^ (pc >> 32);
+  return static_cast<uint32_t>(folded % PATTERN_ENTRIES);
+}
+
+void train_pattern(uint32_t cpu, uint64_t pc, uint64_t key,
+                   int64_t observed_stride)
+{
+  PatternEntry& e = patterns[cpu][pattern_index(pc, key)];
+  if (e.valid && e.key == key) {
+    if (e.next_stride == observed_stride) {
+      if (e.confidence < 3) ++e.confidence;
+    } else {
+      e.next_stride = observed_stride;
+      e.confidence = 0;
+    }
+  } else {
+    e = PatternEntry{};
+    e.key = key;
+    e.next_stride = observed_stride;
+    e.confidence = 0;
+    e.valid = true;
+  }
+}
+
+bool get_pattern_stride(uint32_t cpu, uint64_t pc, uint64_t key,
+                        int64_t& stride)
+{
+  const PatternEntry& e = patterns[cpu][pattern_index(pc, key)];
+  if (!e.valid || e.key != key || e.confidence < 2) return false;
+  stride = e.next_stride;
+  return true;
+}
+}
+
+void CACHE::l1d_prefetcher_initialize()
+{
+  allocations[cpu] = {};
+  samples[cpu] = {};
+  sandbox[cpu] = {};
+  sandbox_replace[cpu] = {};
+  contexts[cpu] = {};
+  patterns[cpu] = {};
+  streams[cpu] = {};
+  next_stream[cpu] = 0;
+  next_sandbox_token[cpu] = 0;
+  last_global_line[cpu] = 0;
+  has_global_line[cpu] = false;
+  std::cout << "Alecto: per-PC allocation with IP stride, SPP, and stream candidates\n";
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit,
+                                  uint8_t type, uint8_t critical_ip_flag)
+{
+  if (type == PREFETCH) return;
+  const uint64_t line = addr >> LOG2_BLOCK_SIZE;
+  const uint64_t page = addr >> LOG2_PAGE_SIZE;
+  AllocationEntry& alloc = allocation(cpu, ip);
+
+// evidence in this ChampSim interface.
+  SandboxEntry* observed = find_sandbox(cpu, line);
+  if (observed != nullptr) {
+    if (cache_hit && observed->l1_filled) {
+      SampleEntry& owner = samples[cpu][pc_index(observed->owner_pc, SAMPLE_ENTRIES)];
+      if (owner.valid && owner.pc == observed->owner_pc &&
+          owner.confirmed[observed->predictor] !=
+              std::numeric_limits<uint64_t>::max())
+        ++owner.confirmed[observed->predictor];
+    }
+    observed->valid = false;
+  }
+
+  PcContext& ctx = context(cpu, ip);
+  std::array<int64_t, 2> stride{};
+  for (uint32_t candidate = 0; candidate < 2; ++candidate) {
+    if (!receives_demand(alloc.state[candidate]) || !ctx.has_last[candidate])
+      continue;
+    if (line > ctx.last_line[candidate] && line - ctx.last_line[candidate] <=
+                                    static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      stride[candidate] = static_cast<int64_t>(line - ctx.last_line[candidate]);
+    else if (line < ctx.last_line[candidate] && ctx.last_line[candidate] - line <=
+                                         static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+      stride[candidate] = -static_cast<int64_t>(ctx.last_line[candidate] - line);
+  }
+
+  if (receives_demand(alloc.state[1]) && stride[1] != 0) {
+    if (ctx.history_count[1] == SIGNATURE_LENGTH)
+      train_pattern(cpu, ip, make_signature(ip, ctx.history[1]), stride[1]);
+    if (stride[1] == ctx.last_stride[1]) {
+      if (ctx.uniform_confidence[1] < 3) ++ctx.uniform_confidence[1];
+    } else {
+      ctx.uniform_confidence[1] = 0;
+    }
+    if (ctx.history_count[1] < SIGNATURE_LENGTH)
+      ctx.history[1][ctx.history_count[1]++] = stride[1];
+    else {
+      ctx.history[1][0] = ctx.history[1][1];
+      ctx.history[1][1] = ctx.history[1][2];
+      ctx.history[1][2] = stride[1];
+    }
+  }
+  for (uint32_t p = 0; p < PREDICTOR_COUNT; ++p) {
+    if (!receives_demand(alloc.state[p])) continue;
+    const uint32_t degree = degree_for(alloc.state[p]);
+    if (p == 0 && stride[0] != 0 && stride[0] == ctx.last_stride[0]) {
+      issue_stride(this, ip, addr, line, stride[0], alloc.state[p], p);
+    } else if (p == 1 && ctx.uniform_confidence[1] >= 3 && stride[1] != 0) {
+      issue_stride(this, ip, addr, line, stride[1], alloc.state[p], p);
+    } else if (p == 1 && ctx.history_count[1] == SIGNATURE_LENGTH) {
+      std::array<int64_t, SIGNATURE_LENGTH> predicted_history = ctx.history[1];
+      uint64_t predicted_line = line;
+      for (uint32_t d = 0; d < degree; ++d) {
+        int64_t predicted_stride = 0;
+        if (!get_pattern_stride(cpu, ip, make_signature(ip, predicted_history),
+                                predicted_stride) || predicted_stride == 0)
+          break;
+        const __int128 target = static_cast<__int128>(predicted_line) +
+                                predicted_stride;
+        if (target < 0 || target > std::numeric_limits<uint64_t>::max()) break;
+        const uint64_t next_line = static_cast<uint64_t>(target);
+        if (next_line > (std::numeric_limits<uint64_t>::max() >>
+                         LOG2_BLOCK_SIZE))
+          break;
+        if (((next_line << LOG2_BLOCK_SIZE) >> LOG2_PAGE_SIZE) != page) break;
+        issue_one(this, ip, addr, next_line, p, d, page);
+        predicted_line = next_line;
+        predicted_history[0] = predicted_history[1];
+        predicted_history[1] = predicted_history[2];
+        predicted_history[2] = predicted_stride;
+      }
+    } else if (p == 2) {
+      bool continued = false;
+      for (StreamEntry& stream : streams[cpu]) {
+        if (!stream.valid) continue;
+        if (stream.page != page) {
+          stream.valid = false;
+          continue;
+        }
+        if (stream.next_line == line) {
+          continued = true;
+          stream.next_line = line + 1;
+          for (uint32_t d = 0; d < degree; ++d)
+            issue_one(this, ip, addr, line + 1 + d, p, d, page);
+        }
+      }
+      const uint64_t page_lines = uint64_t{1} << (LOG2_PAGE_SIZE - LOG2_BLOCK_SIZE);
+      if (!continued && has_global_line[cpu] &&
+          line == last_global_line[cpu] + 1 && line / page_lines == page) {
+        StreamEntry& stream = streams[cpu][next_stream[cpu]];
+        stream.next_line = line + 1;
+        stream.page = page;
+        stream.valid = true;
+        next_stream[cpu] = (next_stream[cpu] + 1) % STREAM_ENTRIES;
+        for (uint32_t d = 0; d < degree; ++d)
+          issue_one(this, ip, addr, line + 1 + d, p, d, page);
+      }
+    }
+  }
+
+  if (receives_demand(alloc.state[2])) {
+    last_global_line[cpu] = line;
+    has_global_line[cpu] = true;
+  }
+  for (uint32_t candidate = 0; candidate < 2; ++candidate) {
+    if (!receives_demand(alloc.state[candidate])) continue;
+    if (stride[candidate] != 0)
+      ctx.last_stride[candidate] = stride[candidate];
+    ctx.last_line[candidate] = line;
+    ctx.has_last[candidate] = true;
+  }
+  transition_epoch(cpu, ip);
+  (void)critical_ip_flag;
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set,
+                                     uint32_t way, uint8_t prefetch,
+                                     uint64_t v_evicted_addr, uint64_t evicted_addr,
+                                     uint32_t metadata_in)
+{
+  if (v_evicted_addr != 0) {
+    SandboxEntry* evicted = find_sandbox(cpu, v_evicted_addr >> LOG2_BLOCK_SIZE);
+    if (evicted != nullptr && evicted->l1_filled)
+      evicted->valid = false;
+  }
+  if (!prefetch) return;
+
+  const uint64_t filled_line = addr >> LOG2_BLOCK_SIZE;
+  for (SandboxEntry& e : sandbox[cpu]) {
+    if (e.valid && e.token == metadata_in && e.line == filled_line) {
+      if (e.l1_requested) e.l1_filled = true;
+      return;
+    }
+  }
+}
+
+void CACHE::l1d_prefetcher_notify_about_dtlb_eviction(uint64_t addr, uint32_t set,
+  uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in) {}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+  std::cout << "Alecto candidates: IP stride, signature stride-pattern, global stream\n";
+}
